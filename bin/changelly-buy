@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+"""changelly-buy: quote crypto card-buy estimates and build attributed buy links.
+
+Subcommands:
+  quote  --crypto XRP --fiat USD --fiat-amount 100
+  link   [--crypto XRP] [--fiat-amount 100]
+
+Config (env):
+  CHANGELLY_REF_URL  Your own referral link from the Changelly affiliate
+                     dashboard, pasted verbatim
+                     (e.g. https://changelly.com/?ref_id=...).
+                     When unset, links carry the maintainer's baked-in
+                     referral attribution instead of being plain.
+
+Quotes are CoinGecko spot estimates (no key needed). They are NOT Changelly's
+final price: provider fees and spread apply at checkout.
+"""
+import argparse
+import json
+import os
+import sys
+import urllib.parse
+import urllib.request
+
+COINGECKO_IDS = {
+    "xrp": "ripple",
+    "btc": "bitcoin",
+    "eth": "ethereum",
+    "sol": "solana",
+    "usdc": "usd-coin",
+    "usdt": "tether",
+    "doge": "dogecoin",
+    "ada": "cardano",
+    "ltc": "litecoin",
+    "bnb": "binancecoin",
+    "trx": "tron",
+    "xlm": "stellar",
+}
+
+CHANGELLY_BUY = "https://changelly.com/buy"
+
+# Default attribution baked in by the maintainer. Set CHANGELLY_REF_URL
+# (pasted verbatim from your own Changelly affiliate dashboard) to
+# attribute buys to yourself instead.
+DEFAULT_REF_URL = "https://changelly.com/?ref_id=alIB5GVBgZ5GAGQb"
+
+
+def fail(msg):
+    print(json.dumps({"ok": False, "error": msg}), file=sys.stderr)
+    sys.exit(1)
+
+
+def coingecko_price(cg_id, fiat):
+    url = (
+        "https://api.coingecko.com/api/v3/simple/price?ids="
+        + urllib.parse.quote(cg_id)
+        + "&vs_currencies="
+        + urllib.parse.quote(fiat.lower())
+    )
+    req = urllib.request.Request(url, headers={"User-Agent": "changelly-buy-skill/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = json.load(r)
+    except Exception as e:  # network or API failure: fail closed, never guess
+        fail(f"price lookup failed: {e}")
+    try:
+        return float(data[cg_id][fiat.lower()])
+    except (KeyError, TypeError, ValueError):
+        fail(f"no {fiat.upper()} price for '{cg_id}' from CoinGecko")
+
+
+def cmd_quote(args):
+    sym = args.crypto.lower()
+    cg_id = COINGECKO_IDS.get(sym, sym)  # unknown symbols pass through as ids
+    fiat = args.fiat.lower()
+    amount = args.fiat_amount
+    if amount <= 0:
+        fail("fiat amount must be positive")
+    price = coingecko_price(cg_id, fiat)
+    est = amount / price
+    print(json.dumps({
+        "ok": True,
+        "crypto": sym.upper(),
+        "fiat": fiat.upper(),
+        "fiat_amount": amount,
+        "spot_price": round(price, 6),
+        "est_crypto": round(est, 6),
+        "source": "coingecko",
+        "disclaimer": (
+            "Estimate from spot price before Changelly provider fees and spread. "
+            "Final price and fees are shown on Changelly before payment."
+        ),
+    }, indent=2))
+
+
+def cmd_link(args):
+    base = os.environ.get("CHANGELLY_REF_URL", "").strip() or DEFAULT_REF_URL
+    # Preserve the referral query params exactly; normalize path to /buy.
+    # Prefill params (verified against a live Changelly buy link):
+    #   from=<fiat code>  to=<crypto code>  amount=<fiat amount>
+    parts = urllib.parse.urlsplit(base)
+    if not parts.scheme or not parts.netloc:
+        fail("CHANGELLY_REF_URL is not a valid URL; paste it verbatim from the affiliate dashboard")
+    path = parts.path.rstrip("/") or "/"
+    if not path.endswith("/buy"):
+        path = (path if path != "/" else "") + "/buy"
+    existing = dict(urllib.parse.parse_qsl(parts.query, keep_blank_values=True))
+    q = {}
+    if args.fiat_amount is not None:
+        if args.fiat_amount <= 0:
+            fail("fiat amount must be positive")
+        amt = args.fiat_amount
+        q["from"] = args.fiat.lower()
+        q["to"] = args.crypto.lower()
+        q["amount"] = str(int(amt)) if float(amt).is_integer() else str(amt)
+    for k, v in existing.items():
+        q.setdefault(k, v)
+    url = urllib.parse.urlunsplit((parts.scheme, parts.netloc, path, urllib.parse.urlencode(q), ""))
+    own_ref = bool(os.environ.get("CHANGELLY_REF_URL", "").strip())
+    attributed = "ref_id" in existing
+    print(json.dumps({
+        "ok": True,
+        "url": url,
+        "attributed": attributed,
+        "attributed_to": "you (CHANGELLY_REF_URL)" if own_ref else "maintainer default",
+        "crypto": args.crypto.upper(),
+        "prefilled": args.fiat_amount is not None,
+        "note": (
+            "Buy link carries affiliate attribution"
+            + (" via your CHANGELLY_REF_URL."
+               if own_ref else
+               " (maintainer's default — set CHANGELLY_REF_URL to your own "
+               "affiliate link to attribute buys to yourself).")
+            if attributed else
+            "No referral attribution on this link."
+        ),
+        "buyer_steps": [
+            "Open the link — fiat, crypto, and amount are prefilled; adjust if needed.",
+            "Enter the wallet address that will receive the crypto"
+            " (plus destination tag/memo if the wallet is an exchange account).",
+            "Complete the provider's identity verification (KYC) and card payment on Changelly.",
+        ],
+    }, indent=2))
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="changelly-buy")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    q = sub.add_parser("quote", help="spot-price estimate for a fiat amount")
+    q.add_argument("--crypto", default="xrp")
+    q.add_argument("--fiat", default="usd")
+    q.add_argument("--fiat-amount", type=float, required=True)
+
+    lk = sub.add_parser("link", help="build the (optionally attributed) buy link")
+    lk.add_argument("--crypto", default="xrp")
+    lk.add_argument("--fiat", default="usd")
+    lk.add_argument("--fiat-amount", type=float, default=None,
+                    help="prefill the buy form with this fiat amount")
+
+    args = ap.parse_args()
+    if args.cmd == "quote":
+        cmd_quote(args)
+    else:
+        cmd_link(args)
+
+
+if __name__ == "__main__":
+    main()
